@@ -1,0 +1,17 @@
+services:
+  goproxy:
+    build:
+      context: .
+    ports:
+      - "3010:3010"
+    environment:
+      - PORT=3010
+    volumes:
+      - ./:/app
+      - goproxy_gomodcache:/go/pkg/mod
+      - goproxy_gocache:/go/cache
+    restart: unless-stopped
+
+volumes:
+  goproxy_gomodcache:
+  goproxy_gocache:
