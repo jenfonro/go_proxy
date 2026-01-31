@@ -32,7 +32,7 @@ const (
 
 	defaultTokenTTLSeconds = 3600
 
-	defaultSpeedMaxBytes     = 20 * 1024 * 1024
+	defaultSpeedMaxBytes     = 4 * 1024 * 1024 * 1024
 	defaultSpeedBytes        = 2 * 1024 * 1024
 	defaultSpeedChunkBytes   = 64 * 1024
 	defaultChunkThresholdB   = 64 * 1024 * 1024
@@ -350,8 +350,8 @@ func serveOnce(
 ) error {
 	basePath := cfg.BasePath
 
-	speedMaxBytes := defaultSpeedMaxBytes
-	speedDefaultBytes := defaultSpeedBytes
+	speedMaxBytes := int64(defaultSpeedMaxBytes)
+	speedDefaultBytes := int64(defaultSpeedBytes)
 	speedChunkBytes := defaultSpeedChunkBytes
 
 	mux := http.NewServeMux()
@@ -373,7 +373,7 @@ func serveOnce(
 
 		n := speedDefaultBytes
 		if raw := strings.TrimSpace(r.URL.Query().Get("bytes")); raw != "" {
-			if v, err := strconv.Atoi(raw); err == nil {
+			if v, err := strconv.ParseInt(raw, 10, 64); err == nil {
 				n = v
 			}
 		}
@@ -388,14 +388,14 @@ func serveOnce(
 		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
 		w.Header().Set("Pragma", "no-cache")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("Content-Length", strconv.Itoa(n))
+		w.Header().Set("Content-Length", strconv.FormatInt(n, 10))
 		w.WriteHeader(http.StatusOK)
 		if r.Method == http.MethodHead || n == 0 {
 			return
 		}
 
 		reader := newRepeatReader(speedChunkBytes)
-		_, _ = io.CopyN(&ctxWriter{ctx: r.Context(), w: w}, reader, int64(n))
+		_, _ = io.CopyN(&ctxWriter{ctx: r.Context(), w: w}, reader, n)
 	})
 
 	// Proxy endpoint: GET/HEAD /<token> (or /<basePath>/<token>)
