@@ -17,6 +17,20 @@
 go run .
 ```
 
-## 配置（环境变量）
+## 配置（config.json）
 
-- `PORT`：监听端口（默认 `3010`）
+- 修改 `config.json` 后，GoProxy 会自动重启以应用新配置（大约 1 秒内生效）。
+
+示例：
+
+```json
+{
+  "basePath": "/proxy"
+}
+```
+
+当 `basePath` 设置为 `/proxy` 时：
+
+- 注册：`POST /proxy/register`
+- 透传：`GET /proxy/<token>`
+- 测速：`GET /proxy/speed?bytes=2097152`

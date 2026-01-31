@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,8 +24,6 @@ import (
 // BuildVersion can be set at build time with:
 //
 //	go build -ldflags "-X catpawopen-go-proxy.BuildVersion=v1.0.0"
-//
-// If GO_PROXY_VERSION is set at runtime, it takes precedence over this value.
 var BuildVersion string
 
 const (
@@ -38,6 +37,9 @@ const (
 	defaultSpeedChunkBytes   = 64 * 1024
 	defaultChunkThresholdB   = 64 * 1024 * 1024
 	defaultUpstreamChunkSize = 32 * 1024 * 1024
+
+	defaultConfigPollInterval = 1 * time.Second
+	defaultConfigDebounce     = 200 * time.Millisecond
 )
 
 type entry struct {
@@ -167,11 +169,7 @@ func (cw *ctxWriter) Write(p []byte) (int, error) {
 }
 
 func serverVersion() string {
-	rawVersion := strings.TrimSpace(os.Getenv("GO_PROXY_VERSION"))
-	if rawVersion == "" {
-		rawVersion = strings.TrimSpace(BuildVersion)
-	}
-	semver := normalizeReleaseSemver(rawVersion)
+	semver := normalizeReleaseSemver(strings.TrimSpace(BuildVersion))
 	if semver == "" {
 		return "beta"
 	}
@@ -210,57 +208,151 @@ func normalizeReleaseSemver(raw string) string {
 	return s
 }
 
-func main() {
-	log.Printf("Go proxy version : %s", serverVersion())
+type config struct {
+	BasePath string `json:"basePath"`
+}
 
-	port := getenvInt("PORT", defaultListenPort)
-	if port <= 0 || port > 65535 {
-		port = defaultListenPort
+func defaultConfig() config {
+	return config{BasePath: ""}
+}
+
+func normalizeBasePath(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" || p == "/" {
+		return ""
 	}
-	listen := fmt.Sprintf("%s:%d", defaultListenHost, port)
-	tokenTTL := time.Duration(defaultTokenTTLSeconds) * time.Second
-	basePath := ""
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	p = strings.TrimRight(p, "/")
+	if p == "/" {
+		return ""
+	}
+	return p
+}
+
+func fileExists(path string) bool {
+	st, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return st.Mode().IsRegular()
+}
+
+func findConfigPath() string {
+	// Prefer config.json in current working directory, so `go run .` and typical service
+	// deployments behave predictably.
+	if fileExists("config.json") {
+		return "config.json"
+	}
+
+	// If launched from the monorepo root, use GoProxy/config.json (create it if missing).
+	if st, err := os.Stat("GoProxy"); err == nil && st.IsDir() {
+		return filepath.Join("GoProxy", "config.json")
+	}
+
+	// Default: create config.json in current working directory.
+	return "config.json"
+}
+
+func ensureDefaultConfigFile(path string) error {
+	if fileExists(path) {
+		return nil
+	}
+	dir := filepath.Dir(path)
+	if dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	b, err := json.MarshalIndent(defaultConfig(), "", "  ")
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+	return os.WriteFile(path, b, 0o644)
+}
+
+func loadConfig(path string) (config, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return config{}, err
+	}
+	defer f.Close()
+
+	cfg := defaultConfig()
+	dec := json.NewDecoder(f)
+	if err := dec.Decode(&cfg); err != nil {
+		return config{}, err
+	}
+	cfg.BasePath = normalizeBasePath(cfg.BasePath)
+	return cfg, nil
+}
+
+func watchConfig(path string, initial config, stop <-chan struct{}, restart chan<- struct{}) {
+	var lastMod time.Time
+	if st, err := os.Stat(path); err == nil {
+		lastMod = st.ModTime()
+	}
+	lastCfg := initial
+
+	t := time.NewTicker(defaultConfigPollInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+			st, err := os.Stat(path)
+			if err != nil {
+				continue
+			}
+			if !st.ModTime().After(lastMod) {
+				continue
+			}
+			lastMod = st.ModTime()
+
+			time.Sleep(defaultConfigDebounce)
+
+			cfg, err := loadConfig(path)
+			if err != nil {
+				log.Printf("[config] reload failed: %v", err)
+				continue
+			}
+			if cfg.BasePath == lastCfg.BasePath {
+				continue
+			}
+			lastCfg = cfg
+			log.Printf("[config] changed, restarting (basePath=%q)", cfg.BasePath)
+			select {
+			case restart <- struct{}{}:
+			default:
+			}
+		}
+	}
+}
+
+func tokenPrefix(basePath string) string {
+	if basePath == "" {
+		return "/"
+	}
+	return basePath + "/"
+}
+
+var errRestartRequested = errors.New("restart requested")
+
+func serveOnce(
+	client *http.Client,
+	s *store,
+	listen string,
+	cfg config,
+	restart <-chan struct{},
+) error {
+	basePath := cfg.BasePath
+
 	speedMaxBytes := defaultSpeedMaxBytes
 	speedDefaultBytes := defaultSpeedBytes
 	speedChunkBytes := defaultSpeedChunkBytes
-
-	// Shared transport/client: reuse connections across range requests to improve throughput.
-	transport := &http.Transport{
-		// IMPORTANT: do not use env proxies (HTTP_PROXY/HTTPS_PROXY). In many home-server setups those
-		// are set for browsers (e.g. 127.0.0.1:7890) and will silently throttle/break large streaming.
-		Proxy: nil,
-		DialContext: (&net.Dialer{
-			Timeout:   15 * time.Second,
-			KeepAlive: 60 * time.Second,
-		}).DialContext,
-		// Disable upstream HTTP/2 to match Node's behavior and avoid H2 flow-control/buffering quirks
-		// observed on some storage/CDN endpoints during long ranged media reads.
-		TLSNextProto:          map[string]func(string, *tls.Conn) http.RoundTripper{},
-		MaxIdleConns:          512,
-		MaxIdleConnsPerHost:   128,
-		IdleConnTimeout:       120 * time.Second,
-		TLSHandshakeTimeout:   15 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		DisableCompression:    true,
-		ReadBufferSize:        64 * 1024,
-		WriteBufferSize:       64 * 1024,
-	}
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   0,
-		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-
-	s := newStore(tokenTTL)
-	go func() {
-		t := time.NewTicker(5 * time.Minute)
-		defer t.Stop()
-		for range t.C {
-			s.prune()
-		}
-	}()
 
 	mux := http.NewServeMux()
 
@@ -306,11 +398,11 @@ func main() {
 		_, _ = io.CopyN(&ctxWriter{ctx: r.Context(), w: w}, reader, int64(n))
 	})
 
-	// Proxy endpoint: GET/HEAD /<token>
+	// Proxy endpoint: GET/HEAD /<token> (or /<basePath>/<token>)
 	// We intentionally use the root prefix so the public playback URL is compact.
 	// Specific handlers like `/speed` and `/register` still win due to net/http mux longest-prefix matching.
-	tokenPrefix := mountPath(basePath, "/")
-	mux.HandleFunc(tokenPrefix, func(w http.ResponseWriter, r *http.Request) {
+	tokenPathPrefix := tokenPrefix(basePath)
+	mux.HandleFunc(tokenPathPrefix, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodOptions {
 			writeCORSHeaders(w)
 			w.WriteHeader(http.StatusNoContent)
@@ -321,11 +413,11 @@ func main() {
 			return
 		}
 		// Do not treat `/` (or the basePath root) as a token request.
-		if r.URL.Path == tokenPrefix {
+		if r.URL.Path == tokenPathPrefix {
 			http.Error(w, "Not Found", http.StatusNotFound)
 			return
 		}
-		token := strings.TrimPrefix(r.URL.Path, tokenPrefix)
+		token := strings.TrimPrefix(r.URL.Path, tokenPathPrefix)
 		token = strings.Trim(token, "/")
 		if strings.Contains(token, ".") {
 			http.Error(w, "Not Found", http.StatusNotFound)
@@ -376,7 +468,7 @@ func main() {
 		}
 	})
 
-	// Register endpoint: POST /register
+	// Register endpoint: POST /register (or /<basePath>/register)
 	mux.HandleFunc(mountPath(basePath, "/register"), func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodOptions {
 			writeCORSHeaders(w)
@@ -435,9 +527,99 @@ func main() {
 	if basePath != "" {
 		log.Printf("Go proxy base path: %s", basePath)
 	}
-	log.Printf("Go proxy listening on %s (ttl=%s)", listen, tokenTTL)
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatal(err)
+	log.Printf("Go proxy listening on %s (ttl=%s)", listen, s.ttl)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.ListenAndServe()
+	}()
+
+	select {
+	case <-restart:
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = server.Shutdown(ctx)
+		cancel()
+		<-errCh
+		return errRestartRequested
+	case err := <-errCh:
+		if err == nil || errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	}
+}
+
+func main() {
+	log.Printf("Go proxy version : %s", serverVersion())
+
+	listen := fmt.Sprintf("%s:%d", defaultListenHost, defaultListenPort)
+	tokenTTL := time.Duration(defaultTokenTTLSeconds) * time.Second
+
+	cfgPath := findConfigPath()
+	if err := ensureDefaultConfigFile(cfgPath); err != nil {
+		log.Fatalf("failed to initialize config file %q: %v", cfgPath, err)
+	}
+
+	// Shared transport/client: reuse connections across range requests to improve throughput.
+	transport := &http.Transport{
+		// IMPORTANT: do not use env proxies (HTTP_PROXY/HTTPS_PROXY). In many home-server setups those
+		// are set for browsers (e.g. 127.0.0.1:7890) and will silently throttle/break large streaming.
+		Proxy: nil,
+		DialContext: (&net.Dialer{
+			Timeout:   15 * time.Second,
+			KeepAlive: 60 * time.Second,
+		}).DialContext,
+		// Disable upstream HTTP/2 to match Node's behavior and avoid H2 flow-control/buffering quirks
+		// observed on some storage/CDN endpoints during long ranged media reads.
+		TLSNextProto:          map[string]func(string, *tls.Conn) http.RoundTripper{},
+		MaxIdleConns:          512,
+		MaxIdleConnsPerHost:   128,
+		IdleConnTimeout:       120 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		DisableCompression:    true,
+		ReadBufferSize:        64 * 1024,
+		WriteBufferSize:       64 * 1024,
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   0,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	s := newStore(tokenTTL)
+	go func() {
+		t := time.NewTicker(5 * time.Minute)
+		defer t.Stop()
+		for range t.C {
+			s.prune()
+		}
+	}()
+
+	for {
+		cfg, err := loadConfig(cfgPath)
+		if err != nil {
+			log.Printf("[config] load failed: %v (using defaults)", err)
+			cfg = defaultConfig()
+			cfg.BasePath = normalizeBasePath(cfg.BasePath)
+		}
+
+		stopWatch := make(chan struct{})
+		restart := make(chan struct{}, 1)
+		go watchConfig(cfgPath, cfg, stopWatch, restart)
+
+		err = serveOnce(client, s, listen, cfg, restart)
+		close(stopWatch)
+
+		if errors.Is(err, errRestartRequested) {
+			continue
+		}
+		if err != nil {
+			log.Fatal(err)
+		}
+		return
 	}
 }
 
@@ -746,18 +928,6 @@ func proxyStreamChunked(client *http.Client, w http.ResponseWriter, r *http.Requ
 		curStart = curEnd + 1
 	}
 	return nil
-}
-
-func getenvInt(key string, def int) int {
-	v := strings.TrimSpace(os.Getenv(key))
-	if v == "" {
-		return def
-	}
-	i, err := strconv.Atoi(v)
-	if err != nil {
-		return def
-	}
-	return i
 }
 
 func mountPath(basePath, suffix string) string {
